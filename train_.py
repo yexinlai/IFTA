@@ -1,167 +1,149 @@
-#!/usr/bin/python3
-# coding=utf-8
-
-import sys
-import datetime
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
+import torch.optim as optim
+import torchvision
 from torch.utils.data import DataLoader
-from tensorboardX import SummaryWriter
-from lib import dataset
-from net import GCPANet
-from torchvision.models.detection import MaskRCNN
-from torchvision.models.detection.rpn import AnchorGenerator
-import logging as logger
-from lib.data_prefetcher import DataPrefetcher
-from lib.lr_finder import LRFinder
+from pycocotools.coco import COCO
+from net import GCPANet  # 假设GCPANet已经实现
+import model as modellib  # 假设Mask-RCNN已经实现
+from config import Config
 import numpy as np
-import matplotlib.pyplot as plt
-import os
 
-os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
-os.environ["CUDA_VISIBLE_DEVICES"] = "0"
-
-TAG = "lung"
-SAVE_PATH = "your_output_path"
-logger.basicConfig(level=logger.INFO, format='%(levelname)s %(asctime)s %(filename)s: %(lineno)d] %(message)s',
-                   datefmt='%Y-%m-%d %H:%M:%S', filename="train_%s.log" % (TAG), filemode="w")
-
-
-# Learning rate scheduler
-def get_triangle_lr(base_lr, max_lr, total_steps, cur, ratio=1., annealing_decay=1e-2, momentums=[0.95, 0.85]):
-    first = int(total_steps * ratio)
-    last = total_steps - first
-    min_lr = base_lr * annealing_decay
-
-    cycle = np.floor(1 + cur / total_steps)
-    x = np.abs(cur * 2.0 / total_steps - 2.0 * cycle + 1)
-    if cur < first:
-        lr = base_lr + (max_lr - base_lr) * np.maximum(0., 1.0 - x)
-    else:
-        lr = ((base_lr - min_lr) * cur + min_lr * first - base_lr * total_steps) / (first - total_steps)
-
-    momentum = momentums[0] + (momentums[1] - momentums[0]) * np.maximum(0., 1. - x)
-    return lr, momentum
-
-
-BASE_LR = 1e-5
-MAX_LR = 0.1
-FIND_LR = False  # True
-
-
+# GCPANet 和 Mask-RCNN 联合模型定义
 class GCPANet_MaskRCNN(nn.Module):
-    def __init__(self, cfg, num_classes):
+    def __init__(self, num_classes):
         super(GCPANet_MaskRCNN, self).__init__()
-
+        
         # Initialize GCPANet
-        self.gcpa_net = GCPANet(cfg)
+        self.gcpa_net = GCPANet()
 
         # Initialize Mask-RCNN with a ResNet50 backbone
         backbone = torchvision.models.resnet50(pretrained=True)
-        backbone = nn.Sequential(*list(backbone.children())[:-2])  # 去掉ResNet的最后两个层
+        backbone = nn.Sequential(*list(backbone.children())[:-2])  # 去掉ResNet的最后两层
         backbone.out_channels = 2048
 
-        # Anchor generator for the FPN, from Mask-RCNN's default configuration
-        anchor_generator = AnchorGenerator(
-            sizes=((32, 64, 128, 256, 512),),
-            aspect_ratios=((0.5, 1.0, 2.0),) * 5
-        )
+        # Initialize Mask-RCNN
+        self.mask_rcnn = modellib.MaskRCNN(backbone, num_classes=num_classes)
 
-        # RoI align layer
-        roi_pooler = torchvision.ops.MultiScaleRoIAlign(
-            featmap_names=['0'], output_size=7, sampling_ratio=2
-        )
+    def forward(self, images, masks, targets=None):
+        # Step 1: 使用 GCPANet 分割肺实质
+        lung_mask = self.gcpa_net(images)  # 得到肺实质分割掩码
 
-        # Initialize Mask-RCNN model
-        self.mask_rcnn = MaskRCNN(backbone, num_classes=num_classes,
-                                  rpn_anchor_generator=anchor_generator,
-                                  box_roi_pool=roi_pooler)
+        # Step 2: 使用分割掩码将非肺实质区域屏蔽
+        combined_input = images * lung_mask
 
-    def forward(self, images, targets=None):
-        # Forward pass through GCPANet
-        gcpa_out = self.gcpa_net(images)
-
-        # Forward pass through Mask-RCNN
+        # Step 3: 使用 Mask-RCNN 进行病灶检测和分割
         if self.training:
-            losses = self.mask_rcnn(gcpa_out, targets)
+            losses = self.mask_rcnn(combined_input, targets)
             return losses
         else:
-            predictions = self.mask_rcnn(gcpa_out)
+            predictions = self.mask_rcnn(combined_input)
             return predictions
 
 
-def train(Dataset, Network, num_classes=91):
-    ## dataset
-    cfg = Dataset.Config(datapath='yourdata_path', savepath=SAVE_PATH, mode='train', batch=8, lr=0.001,
-                         momen=0.9, decay=5e-4, epoch=100)
-    data = Dataset.Data(cfg)
-    loader = DataLoader(data, batch_size=cfg.batch, shuffle=True, num_workers=8)
-    prefetcher = DataPrefetcher(loader)
+# 配置类
+class CustomConfig(Config):
+    NAME = "lung_lesion"
+    IMAGES_PER_GPU = 2
+    NUM_CLASSES = 1 + 1  # 一个病灶类别加背景
+    STEPS_PER_EPOCH = 1000
+    VALIDATION_STEPS = 50
+    DETECTION_MIN_CONFIDENCE = 0.7  # 检测置信度阈值
 
-    ## network
-    model = GCPANet_MaskRCNN(cfg, num_classes).to(device)
-    model.train(True)
 
-    ## parameter separation
-    base, head = [], []
-    for name, param in model.named_parameters():
-        if 'bkbone' in name:
-            base.append(param)
-        else:
-            head.append(param)
-    optimizer = torch.optim.SGD([{'params': base}, {'params': head}], lr=cfg.lr, momentum=cfg.momen,
-                                weight_decay=cfg.decay, nesterov=True)
-    sw = SummaryWriter(cfg.savepath)
-    global_step = 0
+# 自定义数据集类，用于加载肺实质分割掩码和病灶标签
+class LungLesionDataset(COCO):
+    def load_data(self, dataset_dir, subset):
+        """加载COCO格式数据集，准备肺实质掩码和病灶标签"""
+        coco = COCO("{}/annotations/instances_{}{}.json".format(dataset_dir, subset, "2014"))
+        self.load_coco(coco, dataset_dir, subset)
+        self.prepare()
 
-    db_size = len(loader)
-    if FIND_LR:
-        lr_finder = LRFinder(model, optimizer, criterion=None)
-        lr_finder.range_test(loader, end_lr=50, num_iter=100, step_mode="exp")
-        plt.ion()
-        lr_finder.plot()
-        import pdb
-        pdb.set_trace()
+    def load_mask(self, image_id):
+        """加载实例掩码，返回肺实质掩码和病灶标签"""
+        image_info = self.image_info[image_id]
 
-    # Training
-    for epoch in range(cfg.epoch):
-        prefetcher = DataPrefetcher(loader)
-        batch_idx = -1
-        image, mask = prefetcher.next()
-        while image is not None:
-            niter = epoch * db_size + batch_idx
-            lr, momentum = get_triangle_lr(BASE_LR, MAX_LR, cfg.epoch * db_size, niter, ratio=1.)
-            optimizer.param_groups[0]['lr'] = 0.1 * lr  # for backbone
-            optimizer.param_groups[1]['lr'] = lr
-            optimizer.momentum = momentum
-            batch_idx += 1
-            global_step += 1
+        # 使用父类的load_mask方法加载病灶标签
+        lesion_mask, class_ids = super().load_mask(image_id)
 
-            # Forward pass
-            losses = model(image, mask)
-            loss = sum(loss_value for loss_value in losses.values())
+        # 加载预先生成的肺实质分割掩码
+        lung_mask = ...  # 你需要从相应文件夹加载预先生成的肺实质掩码
 
-            # Backprop
+        # 合并病灶掩码和肺实质掩码
+        combined_mask = lesion_mask * lung_mask  # 只保留肺实质区域的病灶掩码
+        return combined_mask, class_ids
+
+
+# 训练函数
+def train_model(dataset_train, dataset_val, config):
+    # 初始化 GCPANet 和 Mask-RCNN 联合模型
+    model = GCPANet_MaskRCNN(num_classes=config.NUM_CLASSES)
+    model = model.cuda()
+
+    # 定义优化器
+    optimizer = optim.SGD(model.parameters(), lr=0.001, momentum=0.9, weight_decay=0.0005)
+
+    # 开始训练
+    for epoch in range(config.EPOCHS):
+        model.train()
+        epoch_loss = 0
+
+        # 遍历数据集
+        for images, masks, targets in DataLoader(dataset_train, batch_size=config.IMAGES_PER_GPU, shuffle=True):
+            images = images.cuda()
+            masks = masks.cuda()
+            targets = [{k: v.cuda() for k, v in t.items()} for t in targets]
+
+            # 前向传播计算损失
+            losses = model(images, masks, targets)
+            loss = sum(loss for loss in losses.values())
+
+            # 反向传播和优化
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
 
-            # Log losses
-            sw.add_scalar('lr', optimizer.param_groups[0]['lr'], global_step=global_step)
-            sw.add_scalars('loss', {k: v.item() for k, v in losses.items()}, global_step=global_step)
+            epoch_loss += loss.item()
+        
+        print(f"Epoch {epoch + 1}/{config.EPOCHS}, Loss: {epoch_loss}")
 
-            if batch_idx % 10 == 0:
-                msg = f"{datetime.datetime.now()} | step: {global_step} | epoch: {epoch+1}/{cfg.epoch} | lr: {optimizer.param_groups[0]['lr']:.6f} | loss: {loss.item():.6f}"
-                print(msg)
-                logger.info(msg)
-
-            image, mask = prefetcher.next()
-
-        if (epoch + 1) % 10 == 0 or (epoch + 1) == cfg.epoch:
-            torch.save(model.state_dict(), f"{cfg.savepath}/model-{epoch+1}")
+        # 每个epoch结束后进行验证
+        evaluate_coco(model, dataset_val)
 
 
+# 验证函数
+def evaluate_coco(model, dataset_val):
+    """在验证集上评估模型性能"""
+    model.eval()
+    total_loss = 0
+
+    with torch.no_grad():
+        for images, masks, targets in DataLoader(dataset_val, batch_size=1, shuffle=False):
+            images = images.cuda()
+            masks = masks.cuda()
+            targets = [{k: v.cuda() for k, v in t.items()} for t in targets]
+
+            # 前向传播进行推理
+            losses = model(images, masks, targets)
+            loss = sum(loss for loss in losses.values())
+            total_loss += loss.item()
+
+    print(f"Validation Loss: {total_loss}")
+
+
+# 主函数
 if __name__ == '__main__':
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    train(dataset, GCPANet)
+    # 初始化配置
+    config = CustomConfig()
+    config.EPOCHS = 50  # 设置训练的epoch数量
+
+    # 加载训练集
+    dataset_train = LungLesionDataset()
+    dataset_train.load_data('/path/to/dataset', 'train')
+
+    # 加载验证集
+    dataset_val = LungLesionDataset()
+    dataset_val.load_data('/path/to/dataset', 'val')
+
+    # 开始训练模型
+    train_model(dataset_train, dataset_val, config)
